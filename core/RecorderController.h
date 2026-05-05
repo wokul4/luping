@@ -61,6 +61,7 @@ private:
     };
 
     void RecordingThread();
+    void RecordingThreadImpl();
     void WriteAudioPackets(AudioEncoder& enc, int streamIdx, FFmpegEncoder& mux);
 
     mutable std::mutex m_statusMtx;

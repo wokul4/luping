@@ -1,5 +1,6 @@
 #pragma once
 #include "IVideoEncoder.h"
+#include <mutex>
 
 struct AVFormatContext;
 struct AVCodecContext;
@@ -34,11 +35,15 @@ public:
     /// Write a pre-encoded packet (e.g. audio) to the output.
     bool WriteExternalPacket(AVPacket* pkt, int streamIndex);
 
+    /// Explicitly write the muxer header. Must be called after all streams
+    /// are registered and before any packet write. Idempotent.
+    bool BeginOutput();
+
     // ---- Low-level access (for external encoders) ----
     AVFormatContext* FormatCtx() { return m_fmtCtx; }
 
 private:
-    bool BeginOutput();       // lazy: open file + write header once
+    bool BeginOutputImpl();   // internal: open file + write header once
     bool OpenVideoCodec();
     bool WriteVideoPacket(AVPacket* pkt);
 
@@ -51,11 +56,20 @@ private:
     // FFmpeg objects
     AVFormatContext* m_fmtCtx    = nullptr;
     AVCodecContext*  m_vidCodec  = nullptr;
-    AVStream*        m_vidStream = nullptr;
+    AVStream*        m_vidStream   = nullptr;
+    AVStream*        m_audioStream   = nullptr;
+    int              m_audioTbNum     = 1;
+    int              m_audioTbDen     = 48000;
     SwsContext*      m_swsCtx    = nullptr;
 
     AVFrame*         m_yuvFrame  = nullptr;
     int64_t          m_framePts  = 0;
 
     std::chrono::steady_clock::time_point m_startTime;
+
+    // Audio stream tracking
+    int m_audioPacketsLogged = 0;  // throttle rescale log to first 3
+
+    // Muxer mutex (all av_interleaved_write_frame / av_write_trailer calls)
+    std::mutex m_muxMutex;
 };

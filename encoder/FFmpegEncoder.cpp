@@ -144,16 +144,29 @@ int FFmpegEncoder::AddAudioStream(AVCodecContext* audioCtx) {
     st->id = m_fmtCtx->nb_streams - 1;
     st->time_base = audioCtx->time_base;
     avcodec_parameters_from_context(st->codecpar, audioCtx);
-    Logger::Instance().Info("Audio stream registered in muxer");
+    m_audioStream = st;
+    m_audioTbNum = audioCtx->time_base.num;
+    m_audioTbDen = audioCtx->time_base.den;
+    Logger::Instance().Info(std::format("MUX: audio stream registered idx={} tb={}/{}",
+        st->index, st->time_base.num, st->time_base.den));
     return st->index;
 }
 
 // ============================================================
-// BeginOutput  –  open file + write header (called lazily)
+// BeginOutput  –  write muxer header (must be called after all
+//                 streams are registered, before any packet write)
 // ============================================================
 bool FFmpegEncoder::BeginOutput() {
     if (m_headerWritten) return true;
+    std::lock_guard lock(m_muxMutex);
+    return BeginOutputImpl();
+}
+
+bool FFmpegEncoder::BeginOutputImpl() {
+    if (m_headerWritten) return true;
     if (!m_fmtCtx)       return false;
+
+    Logger::Instance().Info(std::format("MUX: write header begin streams={}", m_fmtCtx->nb_streams));
 
     std::filesystem::create_directories(
         std::filesystem::path(m_config.outputPath).parent_path());
@@ -165,10 +178,14 @@ bool FFmpegEncoder::BeginOutput() {
     av_dict_set(&opts, "title", "ScreenRecorder", 0);
     int ret = avformat_write_header(m_fmtCtx, &opts);
     av_dict_free(&opts);
-    AV_CHECK(ret, "avformat_write_header");
+    if (ret < 0) return LogAvErr("avformat_write_header", ret);
 
     m_headerWritten = true;
-    Logger::Instance().Info("MKV header written");
+    if (m_audioStream) {
+        Logger::Instance().Info(std::format("MUX: audio stream tb after header={}/{}",
+            m_audioStream->time_base.num, m_audioStream->time_base.den));
+    }
+    Logger::Instance().Info("MUX: write header done");
     return true;
 }
 
@@ -178,8 +195,11 @@ bool FFmpegEncoder::BeginOutput() {
 bool FFmpegEncoder::EncodeFrame(const void* rgbaData, int stride, bool requestKeyframe) {
     if (!m_initialized) return false;
 
-    // Lazy header write
-    if (!m_headerWritten && !BeginOutput()) return false;
+    // Header should already be written via explicit BeginOutput call
+    if (!m_headerWritten) {
+        Logger::Instance().Error("MUX: header not written before video frame");
+        return false;
+    }
 
     // BGRA → YUV420P
     m_yuvFrame->pts = m_framePts;
@@ -225,10 +245,56 @@ bool FFmpegEncoder::WriteVideoPacket(AVPacket* pkt) {
 // WriteExternalPacket  –  for audio or other external streams
 // ============================================================
 bool FFmpegEncoder::WriteExternalPacket(AVPacket* pkt, int streamIndex) {
+    if (m_audioPacketsLogged < 3) {
+        Logger::Instance().Info(std::format(
+            "MUX: WriteExternalPacket ENTER this={} pkt={} fmtCtx={} pktSize={} streamIdx={}",
+            (void*)this, (void*)pkt, (void*)m_fmtCtx,
+            pkt ? pkt->size : -1, streamIndex));
+    }
+
+    if (!pkt) { Logger::Instance().Error("MUX: null pkt"); return false; }
+    if (!m_fmtCtx) { Logger::Instance().Error("MUX: null fmtCtx"); return false; }
+
+    // Ensure header is written before any packet (safety net)
+    if (!m_headerWritten) {
+        if (!BeginOutput()) {
+            Logger::Instance().Error("MUX: header not written, dropping packet");
+            return false;
+        }
+    }
+
     pkt->stream_index = streamIndex;
-    int64_t sz = pkt->size;  // save BEFORE write (av_interleaved_write_frame frees the data)
+
+    // Rescale audio packets from codec time_base to stream time_base
+    if (m_audioStream && streamIndex == m_audioStream->index) {
+        if (m_audioPacketsLogged < 3) {
+            std::string log = std::format(
+                "MUX: audio before rescale pts={} dts={} dur={} size={}",
+                (long long)pkt->pts, (long long)pkt->dts, (long long)pkt->duration, pkt->size);
+            Logger::Instance().Info(log);
+        }
+        AVRational audioCodecTb = {m_audioTbNum, m_audioTbDen};
+        av_packet_rescale_ts(pkt, audioCodecTb, m_audioStream->time_base);
+        if (m_audioPacketsLogged < 3) {
+            std::string log = std::format(
+                "MUX: audio after  rescale pts={} dts={} dur={}",
+                (long long)pkt->pts, (long long)pkt->dts, (long long)pkt->duration);
+        }
+        m_audioPacketsLogged++;
+    }
+
+    // Throttle logging for non-audio or beyond-first-few audio
+    bool logWrite = (m_audioPacketsLogged <= 5);
+
+    int64_t sz = pkt->size;
+    std::lock_guard lock(m_muxMutex);
+    if (logWrite) Logger::Instance().Info("MUX: av_interleaved_write_frame begin");
     int ret = av_interleaved_write_frame(m_fmtCtx, pkt);
-    if (ret < 0) return LogAvErr("av_interleaved_write_frame", ret);
+    if (logWrite) Logger::Instance().Info(std::format("MUX: av_interleaved_write_frame done ret={}", ret));
+    if (ret < 0) {
+        LogAvErr("av_interleaved_write_frame", ret);
+        return false;
+    }
     m_stats.totalBytes += sz;
     return true;
 }
@@ -256,8 +322,9 @@ bool FFmpegEncoder::Finalize() {
         av_packet_free(&pkt);
     }
 
-    // Write trailer
+    // Write trailer (with mutex)
     if (m_fmtCtx && m_headerWritten) {
+        std::lock_guard lock(m_muxMutex);
         av_write_trailer(m_fmtCtx);
     }
 

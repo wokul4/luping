@@ -21,7 +21,8 @@ ScrError AudioCaptureWasapi::Start() {
 
     m_shutdownEvent = CreateEventW(nullptr, TRUE,  FALSE, nullptr);
     m_captureEvent  = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!m_shutdownEvent || !m_captureEvent) {
+    m_readyEvent    = CreateEventW(nullptr, TRUE,  FALSE, nullptr);
+    if (!m_shutdownEvent || !m_captureEvent || !m_readyEvent) {
         Logger::Instance().Error("AudioCapture: CreateEvent failed");
         return ScrError::Unknown;
     }
@@ -32,9 +33,13 @@ ScrError AudioCaptureWasapi::Start() {
         return ScrError::Unknown;
     }
 
-    // Wait for thread to initialise (or fail)
-    WaitForSingleObject(m_thread, 3000);
+    // Wait for thread to initialise (or fail) — 500ms max
+    DWORD waitRet = WaitForSingleObject(m_readyEvent, 500);
 
+    if (waitRet == WAIT_TIMEOUT) {
+        Logger::Instance().Warning(std::format(
+            "AudioCapture({}) init timeout after 500ms", m_type == System ? "Sys" : "Mic"));
+    }
     if (!m_running) {
         Logger::Instance().Warning(std::format(
             "AudioCapture({}) unavailable", m_type == System ? "System" : "Mic"));
@@ -54,6 +59,7 @@ void AudioCaptureWasapi::Stop() {
     }
     if (m_shutdownEvent) { CloseHandle(m_shutdownEvent); m_shutdownEvent = nullptr; }
     if (m_captureEvent)  { CloseHandle(m_captureEvent);  m_captureEvent  = nullptr; }
+    if (m_readyEvent)    { CloseHandle(m_readyEvent);    m_readyEvent    = nullptr; }
     m_running = false;
 }
 
@@ -138,6 +144,7 @@ void AudioCaptureWasapi::RunCapture() {
 
     // ---- running ----
     m_running = true;
+    if (m_readyEvent) SetEvent(m_readyEvent);
 
     {
         HANDLE waitHandles[2] = { m_shutdownEvent, m_captureEvent };
@@ -154,6 +161,7 @@ void AudioCaptureWasapi::RunCapture() {
     m_client->Stop();
 
 done:
+    if (m_readyEvent) SetEvent(m_readyEvent);
     CoUninitialize();
 }
 

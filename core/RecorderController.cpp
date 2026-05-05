@@ -77,6 +77,20 @@ RecorderStatus RecorderController::GetStatus() const {
 // RecordingThread
 // ============================================================
 void RecorderController::RecordingThread() {
+    try {
+        RecordingThreadImpl();
+    } catch (const std::exception& e) {
+        Logger::Instance().Error(std::format("RT: unhandled exception: {}", e.what()));
+        m_lastError = ScrError::Unknown;
+        m_state.store(RecordingState::Error);
+    } catch (...) {
+        Logger::Instance().Error("RT: unhandled unknown exception");
+        m_lastError = ScrError::Unknown;
+        m_state.store(RecordingState::Error);
+    }
+}
+
+void RecorderController::RecordingThreadImpl() {
     Logger::Instance().Info("RT: thread started");
     m_threadStart = std::chrono::steady_clock::now();
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -105,6 +119,13 @@ void RecorderController::RecordingThread() {
     uint64_t fIdx = 0;
     bool hasLastFrame = false;
     double lastStatsSec = 0.0;
+    int64_t audioInitMs = 0;
+    uint64_t audioSysSamples = 0, audioMicSamples = 0, audioMixedSamples = 0;
+    uint64_t audioPacketsWritten = 0, audioBytesWritten = 0;
+    uint64_t audioSilenceFrames = 0;
+    int64_t lastAudioPts = -1;
+    int64_t firstAudioPts = AV_NOPTS_VALUE;
+    uint64_t droppedPreStartSys = 0, droppedPreStartMic = 0;
 
     auto fail = [&](ErrorCode code, const char* msg) {
         Logger::Instance().Error(std::format("RT: {} [{}]", msg, ScrErrorToString(code)));
@@ -138,6 +159,7 @@ void RecorderController::RecordingThread() {
         m_config.captureMode == CaptureMode::Window ? "window" : "monitor"));
 
     // ---------- Init audio ----------
+    Logger::Instance().Info("RT: audio init begin");
     if (m_config.captureSysAudio) {
         sysAudio = new AudioCaptureWasapi(AudioCaptureWasapi::System);
         if (sysAudio->Start() != ScrError::Ok) { delete sysAudio; sysAudio = nullptr; }
@@ -152,6 +174,9 @@ void RecorderController::RecordingThread() {
         int ch = sysAudio ? sysAudio->Channels()   : 2;
         if (!audioEnc.Initialize(sr, ch, 128000)) audioEnabled = false;
     }
+    audioInitMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - m_threadStart).count();
+    Logger::Instance().Info(std::format("RT: audio init done audioEnabled={} totalMs={}", (int)audioEnabled, audioInitMs));
 
     // ---------- Init encoder ----------
     encCfg.width       = outW;
@@ -166,6 +191,29 @@ void RecorderController::RecordingThread() {
     if (audioEnabled) {
         audioStreamIdx = encoder.AddAudioStream(audioEnc.CodecCtx());
         if (audioStreamIdx < 0) audioEnabled = false;
+    }
+
+    // ---- Write muxer header (must be done before any packet) ----
+    if (!encoder.BeginOutput()) {
+        fail(ScrError::MuxerInitFailed, "muxer header write failed");
+        goto cleanup;
+    }
+
+    // ---- Clear pre-start audio backlog ----
+    // Audio capture may have accumulated samples during init; discard them
+    // so that audio PTS 0 aligns with recording start.
+    if (audioEnabled) {
+        float discard[9600];
+        while (sysAudio && sysAudio->ReadSamples(discard, 9600) > 0)
+            droppedPreStartSys += 9600;
+        while (micAudio && micAudio->ReadSamples(discard, 9600) > 0)
+            droppedPreStartMic += 9600;
+        audioSysSamples = 0;
+        audioMicSamples = 0;
+        audioMixedSamples = 0;
+        Logger::Instance().Info(std::format(
+            "AUDIO: cleared pre-start backlog sys={} mic={}",
+            droppedPreStartSys, droppedPreStartMic));
     }
 
     // ---------- Main loop: fixed-output FPS pacing ----------
@@ -224,16 +272,89 @@ void RecorderController::RecordingThread() {
         // ---- Audio (not paced — real-time capture) ----
         if (audioEnabled) {
             float buf[9600];
-            size_t nSys = sysAudio ? sysAudio->ReadSamples(buf, 9600) : 0;
-            size_t nMic = micAudio ? micAudio->ReadSamples(buf + nSys, 9600 - nSys) : 0;
-            float mix[9600];
-            size_t nMix = AudioMixer::Mix(mix, 9600, buf, nSys, 1.0f, buf + nSys, nMic, 1.0f);
-            if (nMix > 0) accum.Append(mix, nMix);
-            size_t chunk = (size_t)audioEnc.FrameSize() * 2;
-            while (accum.Size() >= chunk) {
+            size_t nSys = 0, nMic = 0;
+
+            // Read system audio (stereo)
+            if (sysAudio) {
+                nSys = sysAudio->ReadSamples(buf, 9600);
+                audioSysSamples += nSys;
+            }
+
+            // Read mic audio — if mono, expand to stereo in-place
+            if (micAudio) {
+                float micBuf[4800];
+                size_t nMicRaw = micAudio->ReadSamples(micBuf, 4800);
+                audioMicSamples += nMicRaw;
+                if (nMicRaw > 0 && micAudio->Channels() == 1) {
+                    // Mono → Stereo: duplicate each sample
+                    for (size_t i = nMicRaw; i > 0; --i) {
+                        buf[nSys + i * 2 - 1] = micBuf[i - 1];
+                        buf[nSys + i * 2 - 2] = micBuf[i - 1];
+                    }
+                    nMic = nMicRaw * 2;
+                } else {
+                    // Already stereo or unknown
+                    memcpy(buf + nSys, micBuf, nMicRaw * sizeof(float));
+                    nMic = nMicRaw;
+                }
+            }
+
+            // Mix into accum (input1=sys buf[0..nSys-1], input2=mic buf[nSys..nSys+nMic-1])
+            float mixBuf[9600];
+            size_t nMix = AudioMixer::Mix(mixBuf, 9600, buf, nSys, 1.0f, buf + nSys, nMic, 1.0f);
+            if (nMix > 0) {
+                accum.Append(mixBuf, nMix);
+                audioMixedSamples += nMix;
+            }
+
+            // Encode AAC frames paced by recording elapsed time.
+            // If real samples are insufficient, pad with silence to keep
+            // audio track duration aligned with video.
+            size_t chunk = (size_t)audioEnc.FrameSize() * 2; // stereo float samples per AAC frame
+            auto recElapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - recordingStart).count();
+            int64_t targetChSamples = (int64_t)(recElapsed * 48000);
+            int64_t submittedChSamples = (int64_t)audioEnc.SubmittedFrames() * audioEnc.FrameSize();
+            int64_t maxLeadSamples = 4800; // 100ms lead
+
+            // Keep audio clock in sync: if real samples are insufficient,
+            // pad with silence so the audio track duration matches video.
+            while (submittedChSamples + (int64_t)audioEnc.FrameSize() <= targetChSamples + maxLeadSamples) {
+                if (accum.Size() < chunk) {
+                    float silence[2048] = {};
+                    accum.Append(silence, chunk);
+                    audioSilenceFrames++;
+                }
                 audioEnc.Encode(accum.Data(), chunk, 0);
                 accum.Consume(chunk);
-                WriteAudioPackets(audioEnc, audioStreamIdx, encoder);
+                submittedChSamples += audioEnc.FrameSize();
+                // Write all pending packets
+                while (auto* pkt = audioEnc.TakePacket()) {
+                    // Normalize PTS on original pkt before write
+                    if (firstAudioPts == AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE)
+                        firstAudioPts = pkt->pts;
+                    if (firstAudioPts != AV_NOPTS_VALUE) {
+                        if (pkt->pts != AV_NOPTS_VALUE) pkt->pts -= firstAudioPts;
+                        if (pkt->dts != AV_NOPTS_VALUE) pkt->dts -= firstAudioPts;
+                    }
+
+                    audioPacketsWritten++;
+                    audioBytesWritten += pkt->size;
+                    if (pkt->pts >= 0 && pkt->pts > lastAudioPts)
+                        lastAudioPts = pkt->pts;
+
+                    // Log first 3 packets
+                    if (audioPacketsWritten <= 3) {
+                        Logger::Instance().Info(std::format(
+                            "RC: audio packet idx={} pts={} dts={} size={} streamIdx={}",
+                            audioPacketsWritten, (int64_t)pkt->pts, (int64_t)pkt->dts,
+                            pkt->size, audioStreamIdx));
+                    }
+
+                    // Write via FFmpegEncoder (internal clone for safety)
+                    encoder.WriteExternalPacket(pkt, audioStreamIdx);
+                    av_packet_free(&pkt);
+                }
             }
         }
 
@@ -313,6 +434,17 @@ void RecorderController::RecordingThread() {
 
         ++fIdx;
 
+        // ---- Update UI timer every iteration ----
+        {
+            auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - recordingStart).count();
+            std::lock_guard lock(m_statusMtx);
+            m_status.state   = RecordingState::Recording;
+            m_status.frames  = (int)fIdx;
+            m_status.durationMs = (int64_t)elapsedMs;
+            m_status.fileSize = encoder.GetStats().totalBytes;
+        }
+
         // ---- Periodic STATS (every ~5s of wall-clock) ----
         double elapsedSec = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - recordingStart).count();
@@ -330,13 +462,13 @@ void RecorderController::RecordingThread() {
                 Logger::Instance().Warning(std::format(
                     "RT: output fps drift expected={} enc={}", expectedFrames, fs.encodedFrames));
             }
-            // Update status for UI
-            {
-                std::lock_guard lock(m_statusMtx);
-                m_status.state   = RecordingState::Recording;
-                m_status.frames  = (int)fIdx;
-                m_status.durationMs = (int64_t)(elapsedSec * 1000);
-                m_status.fileSize = s.totalBytes;
+            if (audioEnabled) {
+                Logger::Instance().Info(std::format(
+                    "AUDIO STATS: sysSamples={} micSamples={} mixedSamples={} submittedFrames={} queuedPkts={} writtenPkts={} bytes={} lastPts={} silence={}",
+                    audioSysSamples, audioMicSamples, audioMixedSamples,
+                    audioEnc.SubmittedFrames(), audioEnc.QueuedPackets(),
+                    audioPacketsWritten, audioBytesWritten,
+                    lastAudioPts, audioSilenceFrames));
             }
         }
     }
@@ -345,7 +477,37 @@ void RecorderController::RecordingThread() {
     if (!failed) Logger::Instance().Info("RT: finalizing...");
 
     if (audioEnabled) {
-        if (!accum.Empty()) audioEnc.Encode(accum.Data(), accum.Size(), 0);
+        // ---- Tail padding: pad audio to match final recording duration ----
+        auto recEndMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - recordingStart).count();
+        double recDurSec = recEndMs / 1000.0;
+        int64_t finalTargetSamples = (int64_t)(recDurSec * 48000);
+        int64_t finalSubmitted = (int64_t)audioEnc.SubmittedFrames() * audioEnc.FrameSize();
+        int64_t missing = finalTargetSamples - finalSubmitted;
+        int64_t maxPad = (int64_t)(2.0 * 48000); // max 2 seconds of padding
+
+        if (missing > maxPad) {
+            Logger::Instance().Warning(std::format(
+                "AUDIO: tail pad clamped missingSec={:.3f}", missing / 48000.0));
+            missing = maxPad;
+        }
+
+        int64_t tailPadFrames = 0;
+        while (missing >= (int64_t)audioEnc.FrameSize()) {
+            float silence[2048] = {};
+            accum.Append(silence, (size_t)audioEnc.FrameSize() * 2);
+            audioEnc.Encode(accum.Data(), (size_t)audioEnc.FrameSize() * 2, 0);
+            accum.Consume((size_t)audioEnc.FrameSize() * 2);
+            missing -= audioEnc.FrameSize();
+            tailPadFrames++;
+        }
+
+        if (tailPadFrames > 0) {
+            Logger::Instance().Info(std::format(
+                "AUDIO: tail pad done frames={} sec={:.3f}", tailPadFrames, tailPadFrames * audioEnc.FrameSize() / 48000.0));
+        }
+
+        // Flush AAC encoder
         audioEnc.Flush();
         WriteAudioPackets(audioEnc, audioStreamIdx, encoder);
     }
@@ -360,11 +522,24 @@ void RecorderController::RecordingThread() {
         m_status.durationMs = (int64_t)(fIdx * 1000LL / m_config.fps);
     }
 
+    if (audioEnabled) {
+        auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - recordingStart).count();
+        double audioDurationSec = (double)audioEnc.SubmittedFrames() * audioEnc.FrameSize() / 48000.0;
+        double videoDurationSec = durationMs / 1000.0;
+        Logger::Instance().Info(std::format(
+            "AUDIO FINAL: sysSamples={} micSamples={} mixedSamples={} submittedFrames={} queuedPkts={} writtenPkts={} bytes={} lastPts={} silence={} audioSec={:.3f} videoSec={:.3f} leadSec={:.3f}",
+            audioSysSamples, audioMicSamples, audioMixedSamples,
+            audioEnc.SubmittedFrames(), audioEnc.QueuedPackets(),
+            audioPacketsWritten, audioBytesWritten,
+            lastAudioPts, audioSilenceFrames,
+            audioDurationSec, videoDurationSec, audioDurationSec - videoDurationSec));
+    }
     Logger::Instance().Info(std::format(
-        "RT: done idx={} cap={} enc={} drop={} dupe={} black={} recv={} size={}",
+        "RT: done idx={} cap={} enc={} drop={} dupe={} black={} recv={} audioBytes={} size={}",
         fIdx, fs.capturedFrames, fs.encodedFrames,
         fs.droppedFrames, fs.duplicatedFrames, fs.blackFrames, fs.recoveryCount,
-        encoder.GetStats().totalBytes));
+        audioBytesWritten, encoder.GetStats().totalBytes));
 
 cleanup:
     capture.Shutdown();

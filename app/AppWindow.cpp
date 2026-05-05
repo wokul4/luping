@@ -559,8 +559,8 @@ void AppWindow::OnStartRecording() {
     dis(m_hBitrate); dis(m_hBitrateVal); dis(m_hSysAudio); dis(m_hMicAudio);
     dis(m_hOutputPath); dis(m_hBrowse);
     EnableWindow(m_hStart, FALSE); EnableWindow(m_hPause, TRUE); EnableWindow(m_hStop, TRUE);
-    SetWindowTextW(m_hStart, L"录制中...");
-    SetStatusText(L"正在录制");
+    SetWindowTextW(m_hStart, L"准备中...");
+    SetStatusText(L"正在准备录制...");
 }
 
 void AppWindow::OnStopRecording() {
@@ -636,11 +636,20 @@ void AppWindow::OnBrowseOutput() {
 void AppWindow::UpdateStatusText() {
     auto st = m_controller.GetStatus();
     auto state = m_controller.GetState();
-    if (m_recording || m_paused || state != RecordingState::Idle) {
+
+    // During Starting state, show "正在准备录制..." with no timer
+    if (state == RecordingState::Starting) {
+        m_durText = L"时长：--:--:--";
+        m_sizeText = L"文件大小：--";
+        if (m_statusText.find(L"正在准备") == std::wstring::npos)
+            m_statusText = L"状态：正在准备录制...";
+    } else if (m_recording || m_paused || state != RecordingState::Idle) {
         int sec = (int)(st.durationMs / 1000);
         m_durText = std::format(L"时长：{:02d}:{:02d}:{:02d}", sec / 3600, (sec % 3600) / 60, sec % 60);
         m_sizeText = std::format(L"文件大小：{:.1f} MB", st.fileSize / (1024.0 * 1024.0));
     }
+
+    // Show error in status if applicable
     ScrError e = m_controller.GetLastError();
     if (e != ScrError::Ok && !m_recording) {
         auto msg = ScrErrorToUserMessage(e);
@@ -655,7 +664,6 @@ void AppWindow::UpdateStatusText() {
             }
         }
     }
-    // Partial invalidation: only status area
     if (m_hwnd && m_statusRect.right > m_statusRect.left)
         InvalidateRect(m_hwnd, &m_statusRect, FALSE);
 }

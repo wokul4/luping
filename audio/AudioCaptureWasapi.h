@@ -47,6 +47,7 @@ private:
     // Thread & sync
     HANDLE m_shutdownEvent = nullptr;
     HANDLE m_captureEvent  = nullptr;
+    HANDLE m_readyEvent    = nullptr;
     HANDLE m_thread        = nullptr;
     bool   m_running       = false;
 

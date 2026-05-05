@@ -7,26 +7,24 @@ extern "C" {
 #include <libavutil/frame.h>
 #include <libavutil/opt.h>
 #include <libavutil/samplefmt.h>
-#include <libswresample/swresample.h>
 }
 
 #include "../platform/Logger.h"
 #include <format>
 #include <cstring>
-#include <cassert>
 
-// ============================================================
-// Ctor / Dtor
-// ============================================================
-AudioEncoder::AudioEncoder()  = default;
+static std::string AvStrError(int err) {
+    char buf[AV_ERROR_MAX_STRING_SIZE] = {};
+    av_make_error_string(buf, sizeof(buf), err);
+    return buf;
+}
+
+AudioEncoder::AudioEncoder() = default;
 
 AudioEncoder::~AudioEncoder() {
     Flush();
-    while (auto* pkt = TakePacket())
-        av_packet_free(&pkt);
-    av_frame_free(&m_inFrame);
-    av_frame_free(&m_fltpFrame);
-    swr_free(&m_swrCtx);
+    while (auto* pkt = TakePacket()) av_packet_free(&pkt);
+    av_frame_free(&m_audioFrame);
     avcodec_free_context(&m_codecCtx);
 }
 
@@ -40,10 +38,7 @@ bool AudioEncoder::Initialize(int sampleRate, int channels, int bitrate) {
 
     const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
     if (!codec) codec = avcodec_find_encoder_by_name("libfdk_aac");
-    if (!codec) {
-        Logger::Instance().Error("AudioEncoder: AAC codec not found");
-        return false;
-    }
+    if (!codec) { Logger::Instance().Error("AENC: AAC codec not found"); return false; }
 
     m_codecCtx = avcodec_alloc_context3(codec);
     if (!m_codecCtx) return false;
@@ -52,57 +47,39 @@ bool AudioEncoder::Initialize(int sampleRate, int channels, int bitrate) {
     m_codecCtx->sample_rate = sampleRate;
     m_codecCtx->bit_rate    = bitrate;
     av_channel_layout_default(&m_codecCtx->ch_layout, channels);
-
     m_codecCtx->time_base = AVRational{1, sampleRate};
     m_codecCtx->flags    |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    m_codecCtx->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;
 
-    if (avcodec_open2(m_codecCtx, codec, nullptr) < 0) {
-        Logger::Instance().Error("AudioEncoder: avcodec_open2 failed");
+    int ret = avcodec_open2(m_codecCtx, codec, nullptr);
+    if (ret < 0) {
+        Logger::Instance().Error(std::format("AENC: avcodec_open2 failed: {}", AvStrError(ret)));
         return false;
     }
+
     m_frameSize = m_codecCtx->frame_size; // typically 1024
-
-    // ---- swresample: FLT → FLTP ----
-    AVChannelLayout in_layout;
-    av_channel_layout_default(&in_layout, channels);
-
-    // swr_alloc_set_opts2 is the modern API (FFmpeg 7.x)
-    swr_free(&m_swrCtx);
-    int swrRet = swr_alloc_set_opts2(
-        &m_swrCtx,
-        &m_codecCtx->ch_layout, AV_SAMPLE_FMT_FLTP, sampleRate,   // out
-        &in_layout,             AV_SAMPLE_FMT_FLT,  sampleRate,   // in
-        0, nullptr);
-    if (swrRet < 0 || !m_swrCtx || swr_init(m_swrCtx) < 0) {
-        Logger::Instance().Error("AudioEncoder: swr_init failed");
-        return false;
-    }
-
-    // ---- reusable input frame (FLT interleaved) ----
-    m_inFrame = av_frame_alloc();
-    if (!m_inFrame) return false;
-    m_inFrame->format      = AV_SAMPLE_FMT_FLT;
-    m_inFrame->sample_rate = sampleRate;
-    av_channel_layout_copy(&m_inFrame->ch_layout, &m_codecCtx->ch_layout);
-
-    // ---- reusable FLTP frame ----
-    m_fltpFrame = av_frame_alloc();
-    if (!m_fltpFrame) return false;
-    m_fltpFrame->format      = AV_SAMPLE_FMT_FLTP;
-    m_fltpFrame->sample_rate = sampleRate;
-    av_channel_layout_copy(&m_fltpFrame->ch_layout, &m_codecCtx->ch_layout);
-
     Logger::Instance().Info(std::format(
-        "AudioEncoder(AAC) ready: {} ch, {} Hz, {} bps, frame={} smpl",
-        channels, sampleRate, bitrate, m_frameSize));
+        "AENC: ready fmt={} sr={} ch={} frameSize={} tb=1/{}",
+        av_get_sample_fmt_name(m_codecCtx->sample_fmt),
+        m_codecCtx->sample_rate, m_codecCtx->ch_layout.nb_channels,
+        m_frameSize, m_codecCtx->time_base.den));
+
+    // Single reusable FLTP frame (no swr, manual packed→planar)
+    m_audioFrame = av_frame_alloc();
+    if (!m_audioFrame) return false;
+    // Fields set per-call in Encode
+
     return true;
 }
 
 // ============================================================
-// Encode
+// Encode — packed stereo float → manual FLTP → AAC
+// Input:  L0 R0 L1 R1 ... (interleaved stereo float)
+// Output: AAC packets queued internally
 // ============================================================
 bool AudioEncoder::Encode(const float* pcm, size_t samples, int64_t pts) {
     if (!m_codecCtx) return false;
+    (void)pts; // internal PTS used instead
 
     size_t consumed = 0;
     while (consumed < samples) {
@@ -113,27 +90,51 @@ bool AudioEncoder::Encode(const float* pcm, size_t samples, int64_t pts) {
             if (chSamples == 0) break;
         }
 
-        // Fill input FLT frame
-        av_frame_unref(m_inFrame);
-        m_inFrame->nb_samples = chSamples;
-        if (av_frame_get_buffer(m_inFrame, 0) < 0) return false;
+        // ---- Prepare FLTP frame ----
+        av_frame_unref(m_audioFrame);
+        m_audioFrame->nb_samples  = chSamples;
+        m_audioFrame->format      = AV_SAMPLE_FMT_FLTP;
+        m_audioFrame->sample_rate = m_sampleRate;
+        av_channel_layout_copy(&m_audioFrame->ch_layout, &m_codecCtx->ch_layout);
 
-        float* inData = reinterpret_cast<float*>(m_inFrame->data[0]);
-        memcpy(inData, pcm + consumed, (size_t)chSamples * m_channels * sizeof(float));
+        int ret = av_frame_get_buffer(m_audioFrame, 0);
+        if (ret < 0) {
+            Logger::Instance().Error(std::format(
+                "AENC: get_buffer failed nb={} fmt={} sr={} ch={} err={}",
+                chSamples, (int)AV_SAMPLE_FMT_FLTP, m_sampleRate,
+                m_audioFrame->ch_layout.nb_channels, AvStrError(ret)));
+            return false;
+        }
+        av_frame_make_writable(m_audioFrame);
 
-        // Convert FLT → FLTP
-        av_frame_unref(m_fltpFrame);
-        m_fltpFrame->nb_samples = chSamples;
-        if (av_frame_get_buffer(m_fltpFrame, 0) < 0) return false;
+        // ---- Manual packed → planar conversion ----
+        // m_audioFrame->data[0] = left channel (chSamples floats)
+        // m_audioFrame->data[1] = right channel (chSamples floats)
+        float* left  = reinterpret_cast<float*>(m_audioFrame->data[0]);
+        float* right = reinterpret_cast<float*>(m_audioFrame->data[1]);
+        for (int i = 0; i < chSamples; ++i) {
+            left[i]  = pcm[consumed / m_channels + i * 2];
+            right[i] = pcm[consumed / m_channels + i * 2 + 1];
+        }
 
-        int ret = swr_convert(m_swrCtx,
-                              m_fltpFrame->data, chSamples,
-                              (const uint8_t**)&m_inFrame->data, chSamples);
-        if (ret < 0) return false;
+        m_audioFrame->pts = m_ptsAcc;
 
-        m_fltpFrame->pts = m_ptsAcc;
+        // ---- Send to AAC encoder ----
+        if (m_submittedFrames < 3)
+            Logger::Instance().Info(std::format("AENC: send_frame begin idx={}", m_submittedFrames + 1));
+        ret = avcodec_send_frame(m_codecCtx, m_audioFrame);
+        if (ret < 0) {
+            Logger::Instance().Error(std::format("AENC: send_frame failed: {}", AvStrError(ret)));
+            return false;
+        }
+        m_submittedFrames++;
 
-        if (!SendFrame(m_fltpFrame)) return false;
+        // ---- Receive packets ----
+        if (m_submittedFrames < 4)
+            Logger::Instance().Info(std::format("AENC: receive loop begin idx={}", m_submittedFrames));
+        FlushPackets();
+        if (m_submittedFrames < 4)
+            Logger::Instance().Info(std::format("AENC: receive loop end idx={}", m_submittedFrames));
 
         consumed += (size_t)chSamples * m_channels;
         m_ptsAcc += chSamples;
@@ -144,27 +145,9 @@ bool AudioEncoder::Encode(const float* pcm, size_t samples, int64_t pts) {
 }
 
 // ============================================================
-// Flush
+// FlushPackets
 // ============================================================
-bool AudioEncoder::Flush() {
-    if (!m_codecCtx) return true;
-    return SendFrame(nullptr);
-}
-
-// ============================================================
-// SendFrame / ReceivePackets
-// ============================================================
-bool AudioEncoder::SendFrame(AVFrame* frame) {
-    int ret = avcodec_send_frame(m_codecCtx, frame);
-    if (ret < 0 && ret != AVERROR_EOF) {
-        Logger::Instance().Error(std::format("AAC send_frame error {}", ret));
-        return false;
-    }
-    ReceivePackets();
-    return true;
-}
-
-void AudioEncoder::ReceivePackets() {
+void AudioEncoder::FlushPackets() {
     while (true) {
         AVPacket* pkt = av_packet_alloc();
         int ret = avcodec_receive_packet(m_codecCtx, pkt);
@@ -173,19 +156,47 @@ void AudioEncoder::ReceivePackets() {
             break;
         }
         if (ret < 0) {
+            Logger::Instance().Error(std::format("AENC: receive_packet failed: {}", AvStrError(ret)));
             av_packet_free(&pkt);
-            Logger::Instance().Error(std::format("AAC receive_packet error {}", ret));
             break;
+        }
+        if (m_queuedPackets < 3) {
+            Logger::Instance().Info(std::format("AENC: packet received pts={} dts={} size={} dur={}",
+                (int64_t)pkt->pts, (int64_t)pkt->dts, pkt->size, (int64_t)pkt->duration));
         }
         int next = (m_qHead + 1) % kMaxQ;
         if (next != m_qTail) {
             m_pktQ[m_qHead] = pkt;
             m_qHead = next;
+            m_queuedPackets++;
         } else {
+            Logger::Instance().Error("AENC: packet queue overflow");
             av_packet_free(&pkt);
-            assert(!"AAC pkt queue overflow");
         }
     }
+}
+
+// ============================================================
+// Flush
+// ============================================================
+bool AudioEncoder::Flush() {
+    if (!m_codecCtx) return true;
+    if (m_flushed) { Logger::Instance().Info("AENC: flush already done"); return true; }
+    m_flushed = true;
+    Logger::Instance().Info("AENC: flushing...");
+    int ret = avcodec_send_frame(m_codecCtx, nullptr);
+    if (ret == AVERROR_EOF) {
+        Logger::Instance().Info("AENC: flush already EOF");
+        FlushPackets(); return true;
+    }
+    if (ret < 0) {
+        Logger::Instance().Error(std::format("AENC: flush send_frame failed: {}", AvStrError(ret)));
+        return false;
+    }
+    FlushPackets();
+    Logger::Instance().Info(std::format("AENC: flush done submitted={} queued={}",
+        m_submittedFrames, m_queuedPackets));
+    return true;
 }
 
 // ============================================================
