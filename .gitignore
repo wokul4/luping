@@ -31,6 +31,12 @@ CMakeFiles/
 cmake-build-*/
 CMakeUserPresets.json
 
+# Claude
+.claude/
+
+# Source assets (copy goes to assets/background.jpg)
+summer\ pockets*.jpg
+
 # Temp
 *.tmp
 *.temp

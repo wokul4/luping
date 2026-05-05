@@ -1,10 +1,25 @@
 # ScreenRecorder 录屏助手
 
 一款轻量级 Windows 屏幕录制工具，适用于 Windows 10/11 x64。
+基于 Direct3D 11 + Desktop Duplication API + FFmpeg 构建。
 
 **当前版本：** 0.1.0-beta
 
 ---
+
+## 项目简介
+
+ScreenRecorder 是一个使用 C++20 开发的桌面录屏工具，核心组件包括：
+
+| 层级 | 技术 |
+|------|------|
+| 视频捕获 | Desktop Duplication API (DXGI) |
+| 视频编码 | FFmpeg / libx264 → H.264 |
+| 音频捕获 | WASAPI 回环 + 麦克风 |
+| 音频编码 | FFmpeg / AAC (FLTP) |
+| 封装 | Matroska (MKV) |
+| 音视频同步 | 固定帧率输出 + 音频时钟限流 |
+| UI | Win32 API + GDI+ |
 
 ## 主要功能
 
