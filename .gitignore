@@ -1,0 +1,40 @@
+# Build output
+build/
+dist/
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# Logs
+logs/
+*.log
+
+# Captures (recorded videos)
+captures/
+*.mkv
+*.mp4
+
+# IDE
+.vs/
+.idea/
+.vscode/
+*.sln
+*.suo
+*.user
+*.vcxproj.user
+
+# CMake
+CMakeFiles/
+cmake-build-*/
+CMakeUserPresets.json
+
+# Temp
+*.tmp
+*.temp
+*.bak
+*.swp
+Thumbs.db
+.DS_Store
