@@ -96,6 +96,18 @@ if (Test-Path $KnownLimPath) {
     Copy-Item -Path $KnownLimPath -Destination $DocsDir
 }
 
+# Copy assets (background image)
+Write-Host "Copying assets..." -ForegroundColor Yellow
+$AssetsSrc = Join-Paths $ProjectRoot "assets"
+$AssetsDst = Join-Paths $DistDir "assets"
+if (Test-Path $AssetsSrc) {
+    New-Item -ItemType Directory -Path $AssetsDst -Force | Out-Null
+    Get-ChildItem -Path $AssetsSrc | ForEach-Object {
+        Copy-Item -Path $_.FullName -Destination $AssetsDst
+        Write-Host ("  " + $_.Name) -ForegroundColor DarkGray
+    }
+}
+
 # Create default config/settings.json
 $SettingsPath = Join-Paths $ConfigDir "settings.json"
 $DefaultSettings = @'

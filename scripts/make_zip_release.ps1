@@ -56,6 +56,7 @@ New-Item -ItemType Directory -Path ([System.IO.Path]::Combine($CleanDir, "config
 New-Item -ItemType Directory -Path ([System.IO.Path]::Combine($CleanDir, "logs")) | Out-Null
 New-Item -ItemType Directory -Path ([System.IO.Path]::Combine($CleanDir, "captures")) | Out-Null
 New-Item -ItemType Directory -Path ([System.IO.Path]::Combine($CleanDir, "docs")) | Out-Null
+New-Item -ItemType Directory -Path ([System.IO.Path]::Combine($CleanDir, "assets")) | Out-Null
 
 # Copy files (excluding temp logs, captures)
 Copy-Item -Path ([System.IO.Path]::Combine($SourceDir, "ScreenRecorder.exe")) -Destination $CleanDir
@@ -66,6 +67,15 @@ Copy-Item -Path ([System.IO.Path]::Combine($SourceDir, "config", "settings.json"
 $knownLim = [System.IO.Path]::Combine($SourceDir, "docs", "known-limitations.md")
 if (Test-Path $knownLim) {
     Copy-Item -Path $knownLim -Destination ([System.IO.Path]::Combine($CleanDir, "docs"))
+}
+
+# Copy assets
+$assetsDir = [System.IO.Path]::Combine($SourceDir, "assets")
+$assetsDst = [System.IO.Path]::Combine($CleanDir, "assets")
+if (Test-Path $assetsDir) {
+    Get-ChildItem -Path $assetsDir | ForEach-Object {
+        Copy-Item -Path $_.FullName -Destination $assetsDst
+    }
 }
 
 # .gitkeep in empty dirs

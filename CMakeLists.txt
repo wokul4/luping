@@ -26,6 +26,8 @@ set(SOURCES
     platform/Logger.cpp
     platform/D3D11Device.cpp
 
+    ui/BackgroundRenderer.cpp
+
     capture/MonitorEnumerator.cpp
     capture/DesktopDuplicationSource.cpp
     capture/FrameSaver.cpp
@@ -57,5 +59,6 @@ target_link_libraries(ScreenRecorder PRIVATE
     uuid.lib
     comctl32.lib
     dwmapi.lib
+    gdiplus.lib
     ${FFMPEG_LIBRARIES}
 )

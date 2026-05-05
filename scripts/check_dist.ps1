@@ -72,6 +72,7 @@ foreach ($dll in $requiredDlls) {
 Check "README.md exists"             { Test-Path (Join-Path $DistDir "README.md") }
 Check "VERSION.txt exists"           { Test-Path (Join-Path $DistDir "VERSION.txt") }
 Warn   "docs/known-limitations.md"    { Test-Path ([System.IO.Path]::Combine($DistDir, "docs", "known-limitations.md")) }
+Check "assets/background.jpg"           { Test-Path ([System.IO.Path]::Combine($DistDir, "assets", "background.jpg")) }
 
 # Summary
 Write-Host "`n=== Results ===" -ForegroundColor Cyan

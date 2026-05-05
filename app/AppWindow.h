@@ -7,6 +7,7 @@
 #include "../core/AppSettings.h"
 #include "../capture/GameCaptureSource.h"
 #include "../capture/GameWindowEnumerator.h"
+#include "../ui/BackgroundRenderer.h"
 #include "HotkeyManager.h"
 
 class AppWindow {
@@ -30,6 +31,7 @@ private:
     LRESULT WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
     void CreateControls(HWND hwnd);
+    void LayoutControls(int width, int height);
     void PopulateSourceList();
     void ApplySelectionToConfig();
     void UpdateWindowInfoText();
@@ -40,7 +42,28 @@ private:
     void OnBrowseOutput();
     void OnRefreshWindows();
     void UpdateStatusText();
+    void SetStatusText(const std::wstring& text);
     void SaveSettings();
+
+    void CreateThemeBrushesAndFonts();
+    void DestroyThemeBrushesAndFonts();
+
+    // Fixed layout constants
+    static constexpr int kPanelX = 32;
+    static constexpr int kPanelY = 56;
+    static constexpr int kPanelW = 740;
+    static constexpr int kInnerPad = 20;
+    static constexpr int kLabelW = 90;
+    static constexpr int kRowH = 36;
+    static constexpr int kSectionGap = 18;
+
+    // Section positions (computed in LayoutControls)
+    struct SectionRects {
+        int srcX, srcY, srcW, srcH;
+        int setX, setY, setW, setH;
+        int actX, actY, actW, actH;
+        int staX, staY, staW, staH;
+    } m_sec{};
 
     enum CtrlId {
         IDC_SOURCE      = 101,
@@ -90,7 +113,6 @@ private:
     GameWindowEnumerator    m_winEnum;
 
     void ApplySettingsToUI();
-    void ReadUItoConfig();
 
     RecorderController m_controller;
     HotkeyManager      m_hotkeys;
@@ -100,4 +122,36 @@ private:
 
     bool m_recording = false;
     bool m_paused    = false;
+
+    BackgroundRenderer m_bgRenderer;
+
+    // Brushes
+    HBRUSH m_bgBrush       = nullptr;
+    HBRUSH m_staticBrush   = nullptr;
+    HBRUSH m_inputBrush    = nullptr; // light gray for edit/combo
+
+    // Status text (drawn in WM_PAINT, not white static controls)
+    std::wstring m_statusText  = L"状态：就绪";
+    std::wstring m_durText     = L"时长：00:00:00";
+    std::wstring m_sizeText    = L"文件大小：0.0 MB";
+    RECT m_statusRect = {}; // cached status area rect for partial invalidation
+
+    // Fonts
+    HFONT m_fontTitle    = nullptr; // 22pt bold for section titles
+    HFONT m_fontLabel    = nullptr; // 18pt for labels
+    HFONT m_fontControl  = nullptr; // 17pt for controls
+    HFONT m_fontButton   = nullptr; // 18pt bold for buttons
+    HFONT m_fontStatus   = nullptr; // 28pt bold for status text
+    HFONT m_fontSmall    = nullptr; // 15pt for details
+
+    // Colors
+    static constexpr COLORREF cText       = RGB(245, 248, 255);
+    static constexpr COLORREF cTextDim    = RGB(195, 208, 230);
+    static constexpr COLORREF cTextDis    = RGB(140, 150, 165);
+    static constexpr COLORREF cBlue       = RGB(45, 140, 255);
+    static constexpr COLORREF cGreen      = RGB(80, 220, 130);
+    static constexpr COLORREF cRed        = RGB(240, 90, 90);
+    static constexpr COLORREF cPanelBg    = RGB(12, 22, 38);
+    static constexpr COLORREF cSectionBg  = RGB(18, 32, 52);
+    static constexpr COLORREF cBorder     = RGB(70, 105, 150);
 };
