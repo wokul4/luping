@@ -129,12 +129,15 @@ private:
     HBRUSH m_bgBrush       = nullptr;
     HBRUSH m_staticBrush   = nullptr;
     HBRUSH m_inputBrush    = nullptr; // light gray for edit/combo
+    HBRUSH m_winInfoBrush  = nullptr; // dark bg for info bar
 
     // Status text (drawn in WM_PAINT, not white static controls)
     std::wstring m_statusText  = L"状态：就绪";
     std::wstring m_durText     = L"时长：00:00:00";
     std::wstring m_sizeText    = L"文件大小：0.0 MB";
-    RECT m_statusRect = {}; // cached status area rect for partial invalidation
+    RECT m_statusRect = {};   // cached status area rect for partial invalidation
+    RECT m_winInfoRect = {};  // info bar rect, drawn in WM_PAINT
+    std::wstring m_winInfoText; // info bar text, drawn in WM_PAINT
 
     // Fonts
     HFONT m_fontTitle    = nullptr; // 22pt bold for section titles

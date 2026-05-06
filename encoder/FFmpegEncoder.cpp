@@ -166,10 +166,26 @@ bool FFmpegEncoder::BeginOutputImpl() {
     if (m_headerWritten) return true;
     if (!m_fmtCtx)       return false;
 
-    Logger::Instance().Info(std::format("MUX: write header begin streams={}", m_fmtCtx->nb_streams));
+    Logger::Instance().Info(std::format("MUX: write header begin streams={} path={}",
+        m_fmtCtx->nb_streams, m_config.outputPath));
 
-    std::filesystem::create_directories(
-        std::filesystem::path(m_config.outputPath).parent_path());
+    // Ensure parent directory exists and is writable
+    std::error_code ec;
+    auto parent = std::filesystem::path(m_config.outputPath).parent_path();
+    if (!parent.empty() && !std::filesystem::exists(parent)) {
+        if (!std::filesystem::create_directories(parent, ec)) {
+            Logger::Instance().Error(std::format("MUX: create_directories failed: {} path={}",
+                ec.message(), parent.string()));
+            return LogAvErr("avio_open - cannot create output directory", AVERROR(EACCES));
+        }
+        Logger::Instance().Info(std::format("MUX: created output dir {}", parent.string()));
+    }
+    if (!parent.empty() && std::filesystem::exists(parent)) {
+        auto perms = std::filesystem::status(parent).permissions();
+        bool writable = (perms & std::filesystem::perms::owner_write) != std::filesystem::perms::none;
+        Logger::Instance().Info(std::format("MUX: output dir exists={} writable={}",
+            std::filesystem::exists(parent), writable));
+    }
 
     AV_CHECK(avio_open(&m_fmtCtx->pb, m_config.outputPath.c_str(), AVIO_FLAG_WRITE),
              "avio_open");

@@ -7,6 +7,17 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 }
 
+static std::string WstrToUtf8(const std::wstring& wstr) {
+    if (wstr.empty()) return {};
+    int size = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(),
+                                   nullptr, 0, nullptr, nullptr);
+    if (size <= 0) return {};
+    std::string result(size, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(),
+                        result.data(), size, nullptr, nullptr);
+    return result;
+}
+
 RecorderController::RecorderController()  = default;
 RecorderController::~RecorderController() { Shutdown(); }
 
@@ -183,7 +194,7 @@ void RecorderController::RecordingThreadImpl() {
     encCfg.height      = outH;
     encCfg.fps         = m_config.fps;
     encCfg.bitrateKbps = m_config.bitrateKbps;
-    encCfg.outputPath  = std::filesystem::path(m_config.outputPath).string();
+    encCfg.outputPath  = WstrToUtf8(m_config.outputPath);
     encCfg.preset      = "medium";
 
     if (!encoder.Initialize(encCfg)) { fail(ScrError::EncoderInitFailed, "encoder init"); goto cleanup; }

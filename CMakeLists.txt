@@ -41,13 +41,24 @@ set(SOURCES
     audio/AudioEncoder.cpp
 )
 
-add_executable(ScreenRecorder ${SOURCES})
+set(RC_FILE ScreenRecorder.rc)
+
+add_executable(ScreenRecorder ${SOURCES} ${RC_FILE})
 
 set_target_properties(ScreenRecorder PROPERTIES WIN32_EXECUTABLE TRUE)
 
 target_include_directories(ScreenRecorder PRIVATE
     ${CMAKE_SOURCE_DIR}
     ${FFMPEG_INCLUDE_DIRS}
+)
+
+target_compile_definitions(ScreenRecorder PRIVATE
+    $<$<CONFIG:Debug>:DEBUG>
+)
+
+# Resource compiler include paths
+set_target_properties(ScreenRecorder PROPERTIES
+    VS_RESOURCE_GENERAL_INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}"
 )
 
 target_link_libraries(ScreenRecorder PRIVATE

@@ -1,4 +1,5 @@
 #include "AppWindow.h"
+#include "resource.h"
 #include "../platform/Logger.h"
 #include <format>
 #include <filesystem>
@@ -6,6 +7,8 @@
 #include <shellapi.h>
 #include <windowsx.h>
 #include <gdiplus.h>
+#include <uxtheme.h>
+#pragma comment(lib, "uxtheme.lib")
 
 extern const char* kAppVersion;
 
@@ -22,13 +25,23 @@ bool AppWindow::Create(HINSTANCE hInstance, const AppSettings& settings, const s
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     m_settings = settings; m_exeDir = exeDir; m_hInst = hInstance;
 
-    WNDCLASS wc = {};
-    wc.lpfnWndProc = WndProcStatic; wc.hInstance = hInstance;
-    wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    int cxIcon = GetSystemMetrics(SM_CXICON);
+    int cyIcon = GetSystemMetrics(SM_CYICON);
+    int cxSmIcon = GetSystemMetrics(SM_CXSMICON);
+    int cySmIcon = GetSystemMetrics(SM_CYSMICON);
+    HICON hIconBig = (HICON)LoadImage(hInstance, MAKEINTRESOURCE(IDI_APPICON), IMAGE_ICON, cxIcon, cyIcon, LR_SHARED);
+    HICON hIconSmall = (HICON)LoadImage(hInstance, MAKEINTRESOURCE(IDI_APPICON), IMAGE_ICON, cxSmIcon, cySmIcon, LR_SHARED);
+
+    WNDCLASSEX wc = {};
+    wc.cbSize        = sizeof(WNDCLASSEX);
+    wc.lpfnWndProc   = WndProcStatic;
+    wc.hInstance     = hInstance;
+    wc.hIcon         = hIconBig;
+    wc.hIconSm       = hIconSmall;
+    wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = nullptr; // no default erase
     wc.lpszClassName = L"ScreenRecorderWindow";
-    if (!RegisterClass(&wc)) return false;
+    if (!RegisterClassEx(&wc)) return false;
 
     wchar_t eb[MAX_PATH];
     GetModuleFileNameW(nullptr, eb, MAX_PATH);
@@ -44,13 +57,15 @@ bool AppWindow::Create(HINSTANCE hInstance, const AppSettings& settings, const s
     if (!m_hwnd) return false;
     SetWindowLongPtrW(m_hwnd, GWLP_USERDATA, (LONG_PTR)this);
 
+    SendMessageW(m_hwnd, WM_SETICON, ICON_BIG, (LPARAM)hIconBig);
+    SendMessageW(m_hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hIconSmall);
+
     auto bgPath = exeDir / L"assets" / L"background.jpg";
     Logger::Instance().Info(std::format("BG: load result={}", m_bgRenderer.Load(bgPath) ? "success" : "failed"));
 
     CreateThemeBrushesAndFonts();
     CreateControls(m_hwnd);
     ApplySettingsToUI();
-    PopulateSourceList();
 
     auto capDir = m_settings.savedOutputDir.empty()
         ? (m_exeDir / m_settings.outputDir) : std::filesystem::path(m_settings.savedOutputDir);
@@ -72,6 +87,7 @@ bool AppWindow::Create(HINSTANCE hInstance, const AppSettings& settings, const s
         return false;
     }
     SetTimer(m_hwnd, ID_STATUS_TIMER, 500, nullptr);
+    PopulateSourceList();
     Logger::Instance().Info("APP: ui init complete — double buffering enabled, input text=black");
     return true;
 }
@@ -93,6 +109,7 @@ void AppWindow::CreateThemeBrushesAndFonts() {
     m_bgBrush = CreateSolidBrush(RGB(18, 32, 52));
     m_staticBrush = CreateSolidBrush(RGB(18, 32, 52));
     m_inputBrush = CreateSolidBrush(RGB(232, 236, 242));
+    m_winInfoBrush = CreateSolidBrush(RGB(8, 18, 36));
     m_fontTitle = MakeFont(20, FW_BOLD);
     m_fontLabel = MakeFont(16, FW_NORMAL);
     m_fontControl = MakeFont(15, FW_NORMAL);
@@ -103,10 +120,10 @@ void AppWindow::CreateThemeBrushesAndFonts() {
 
 void AppWindow::DestroyThemeBrushesAndFonts() {
     auto d = [](void* p) { if (p) DeleteObject(p); };
-    d(m_bgBrush); d(m_staticBrush); d(m_inputBrush);
+    d(m_bgBrush); d(m_staticBrush); d(m_inputBrush); d(m_winInfoBrush);
     d(m_fontTitle); d(m_fontLabel); d(m_fontControl);
     d(m_fontButton); d(m_fontStatus); d(m_fontSmall);
-    m_bgBrush = m_staticBrush = m_inputBrush = nullptr;
+    m_bgBrush = m_staticBrush = m_inputBrush = m_winInfoBrush = nullptr;
 }
 
 // ============================================================
@@ -146,6 +163,32 @@ LRESULT AppWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_BITRATE:
             if (HIWORD(wp) == CBN_SELCHANGE) {
                 EnableWindow(m_hBitrateVal, (int)SendMessage(m_hBitrate, CB_GETCURSEL, 0, 0) == 3);
+            }
+            break;
+        case IDC_FPS_30:
+            if (HIWORD(wp) == BN_CLICKED) {
+                m_config.fps = 30;
+                RedrawWindow(m_hFps30, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+                RedrawWindow(m_hFps60, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+            }
+            break;
+        case IDC_FPS_60:
+            if (HIWORD(wp) == BN_CLICKED) {
+                m_config.fps = 60;
+                RedrawWindow(m_hFps30, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+                RedrawWindow(m_hFps60, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+            }
+            break;
+        case IDC_SYS_AUDIO:
+            if (HIWORD(wp) == BN_CLICKED) {
+                m_config.captureSysAudio = !m_config.captureSysAudio;
+                RedrawWindow(m_hSysAudio, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+            }
+            break;
+        case IDC_MIC_AUDIO:
+            if (HIWORD(wp) == BN_CLICKED) {
+                m_config.captureMic = !m_config.captureMic;
+                RedrawWindow(m_hMicAudio, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
             }
             break;
         }
@@ -226,6 +269,19 @@ LRESULT AppWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g.DrawString(m_sizeText.c_str(), -1, &smallFont,
             Gdiplus::PointF((Gdiplus::REAL)(m_sec.staX + 280), (Gdiplus::REAL)(m_sec.staY + 50)), &dimBr);
 
+        // Info bar: self-drawn in WM_PAINT (no child control)
+        if (m_winInfoRect.right > m_winInfoRect.left) {
+            FillRect(memDC, &m_winInfoRect, m_winInfoBrush);
+            RECT textRc = m_winInfoRect;
+            textRc.left += 10; textRc.right -= 10;
+            SetTextColor(memDC, RGB(220, 228, 240));
+            SetBkMode(memDC, TRANSPARENT);
+            HFONT oldFont = (HFONT)SelectObject(memDC, m_fontLabel);
+            DrawTextW(memDC, m_winInfoText.c_str(), -1, &textRc,
+                DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);
+            SelectObject(memDC, oldFont);
+        }
+
         // Blit to screen in one shot
         BitBlt(hdc, 0, 0, w, h, memDC, 0, 0, SRCCOPY);
 
@@ -257,7 +313,8 @@ LRESULT AppWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_CTLCOLORBTN: {
         HDC hdc = (HDC)wp;
-        SetBkMode(hdc, TRANSPARENT);
+        SetBkMode(hdc, OPAQUE);
+        SetBkColor(hdc, RGB(18, 32, 52));
         SetTextColor(hdc, RGB(245, 248, 255)); // white text
         return (LRESULT)m_staticBrush;
     }
@@ -279,7 +336,98 @@ LRESULT AppWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int id = (int)wp;
         bool en = !(dis->itemState & ODS_DISABLED);
         bool pr = (dis->itemState & ODS_SELECTED) != 0;
+        // Read app state directly — BM_GETCHECK is unreliable for BS_OWNERDRAW
+        bool chk = false;
+        switch (id) {
+        case IDC_FPS_30:     chk = (m_config.fps == 30); break;
+        case IDC_FPS_60:     chk = (m_config.fps == 60); break;
+        case IDC_SYS_AUDIO:  chk = m_config.captureSysAudio; break;
+        case IDC_MIC_AUDIO:  chk = m_config.captureMic; break;
+        }
 
+        // --- Radio / Checkbox owner-draw ---
+        if (id == IDC_FPS_30 || id == IDC_FPS_60 ||
+            id == IDC_SYS_AUDIO || id == IDC_MIC_AUDIO) {
+            HDC hdc = dis->hDC;
+            RECT& r = dis->rcItem;
+            bool isRadio = (id == IDC_FPS_30 || id == IDC_FPS_60);
+
+            // Background
+            COLORREF bgCol = en ? RGB(8, 18, 36) : RGB(15, 20, 30);
+            SetDCBrushColor(hdc, bgCol);
+            FillRect(hdc, &r, (HBRUSH)GetStockObject(DC_BRUSH));
+
+            // Indicator rect (left side, vertically centered)
+            int iSize = 14;
+            int iY = r.top + (r.bottom - r.top - iSize) / 2;
+            RECT ir = { r.left + 8, iY, r.left + 8 + iSize, iY + iSize };
+
+            if (isRadio) {
+                // Outer ring
+                auto oldPen = SelectObject(hdc, GetStockObject(DC_PEN));
+                auto oldBr  = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                SetDCPenColor(hdc, chk ? RGB(45, 140, 255) : (en ? RGB(160, 180, 210) : RGB(90, 100, 110)));
+                Ellipse(hdc, ir.left, ir.top, ir.right, ir.bottom);
+
+                if (chk) {
+                    // Solid filled dot — large enough to see clearly
+                    SetDCBrushColor(hdc, RGB(45, 140, 255));
+                    SelectObject(hdc, GetStockObject(DC_BRUSH));
+                    int pad = 3;
+                    Ellipse(hdc, ir.left + pad, ir.top + pad, ir.right - pad, ir.bottom - pad);
+                }
+                SelectObject(hdc, oldBr);
+                SelectObject(hdc, oldPen);
+            } else {
+                // Checkbox square
+                auto oldPen = SelectObject(hdc, GetStockObject(DC_PEN));
+                auto oldBr  = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                SetDCPenColor(hdc, chk ? RGB(45, 140, 255) : (en ? RGB(160, 180, 210) : RGB(90, 100, 110)));
+                Rectangle(hdc, ir.left, ir.top, ir.right, ir.bottom);
+
+                if (chk) {
+                    // Filled background
+                    SetDCBrushColor(hdc, RGB(45, 140, 255));
+                    SelectObject(hdc, GetStockObject(DC_BRUSH));
+                    RECT fr = { ir.left + 1, ir.top + 1, ir.right - 1, ir.bottom - 1 };
+                    FillRect(hdc, &fr, (HBRUSH)GetStockObject(DC_BRUSH));
+
+                    // White checkmark — drawn with lines for clarity
+                    HPEN chkPen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
+                    SelectObject(hdc, chkPen);
+                    int cx = ir.left + 2;
+                    int cy = ir.top + 2;
+                    int cw = iSize - 4;
+                    int ch = iSize - 4;
+                    MoveToEx(hdc, cx + 1,        cy + ch / 2,     nullptr);
+                    LineTo(hdc,   cx + cw / 3,   cy + ch - 1);
+                    LineTo(hdc,   cx + cw - 1,   cy);
+                    SelectObject(hdc, oldPen);
+                    DeleteObject(chkPen);
+                } else {
+                    SelectObject(hdc, oldPen);
+                }
+                SelectObject(hdc, oldBr);
+            }
+
+            // Label text
+            RECT tr = r;
+            tr.left = ir.right + 8;
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, en ? RGB(220, 228, 240) : RGB(120, 130, 145));
+            wchar_t txt[128];
+            GetWindowTextW(dis->hwndItem, txt, 128);
+            HFONT oldFont = (HFONT)SelectObject(hdc, m_fontLabel);
+            DrawTextW(hdc, txt, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+            SelectObject(hdc, oldFont);
+
+            if (dis->itemState & ODS_FOCUS)
+                DrawFocusRect(hdc, &r);
+
+            return TRUE;
+        }
+
+        // --- Action buttons (Start / Pause / Stop) ---
         COLORREF bg, fg;
         if (id == IDC_START) {
             bg = en ? (pr ? RGB(20, 100, 200) : RGB(35, 130, 255)) : RGB(60, 70, 85);
@@ -320,7 +468,7 @@ void AppWindow::LayoutControls(int width, int height) {
     int sy1 = m_sec.srcY, cy1 = sy1 + 36;
     SetWindowPos(m_hSource, nullptr, sx + 18, cy1 - 2, 520, 180, SWP_NOZORDER);
     SetWindowPos(m_hRefresh, nullptr, sx + iw - 100, cy1 - 2, 100, 34, SWP_NOZORDER);
-    SetWindowPos(m_hWinInfo, nullptr, sx + 18, cy1 + 40, iw - 20, 22, SWP_NOZORDER);
+    SetRect(&m_winInfoRect, sx + 18, cy1 + 40, sx + 18 + iw - 20, cy1 + 40 + 30);
 
     // Settings
     m_sec.setX = sx; m_sec.setY = m_sec.srcY + m_sec.srcH + 14;
@@ -374,11 +522,10 @@ void AppWindow::CreateControls(HWND hwnd) {
     setFont(m_hSource, m_fontControl);
     m_hRefresh = mk(L"BUTTON", L"刷新", BS_PUSHBUTTON | WS_TABSTOP, dx, dy, 100, 34, IDC_REFRESH);
     setFont(m_hRefresh, m_fontLabel);
-    m_hWinInfo = mk(L"STATIC", L"", SS_LEFT, dx, dy, 100, 22, IDC_WIN_INFO);
-    setFont(m_hWinInfo, m_fontSmall);
+    // Info bar is drawn in WM_PAINT, no child control needed.
 
-    m_hFps30 = mk(L"BUTTON", L"30 FPS", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, dx, dy, 100, 28, IDC_FPS_30);
-    m_hFps60 = mk(L"BUTTON", L"60 FPS", BS_AUTORADIOBUTTON | WS_TABSTOP, dx, dy, 100, 28, IDC_FPS_60);
+    m_hFps30 = mk(L"BUTTON", L"30 FPS", BS_OWNERDRAW | WS_TABSTOP, dx, dy, 100, 28, IDC_FPS_30);
+    m_hFps60 = mk(L"BUTTON", L"60 FPS", BS_OWNERDRAW | WS_TABSTOP, dx, dy, 100, 28, IDC_FPS_60);
     Button_SetCheck(m_hFps30, BST_CHECKED);
     setFont(m_hFps30, m_fontControl); setFont(m_hFps60, m_fontControl);
 
@@ -393,10 +540,10 @@ void AppWindow::CreateControls(HWND hwnd) {
     EnableWindow(m_hBitrateVal, FALSE);
     setFont(m_hBitrateVal, m_fontControl);
 
-    m_hSysAudio = mk(L"BUTTON", L"录制系统声音", BS_AUTOCHECKBOX | WS_TABSTOP, dx, dy, 150, 28, IDC_SYS_AUDIO);
+    m_hSysAudio = mk(L"BUTTON", L"录制系统声音", BS_OWNERDRAW | WS_TABSTOP, dx, dy, 150, 28, IDC_SYS_AUDIO);
     Button_SetCheck(m_hSysAudio, BST_CHECKED);
     setFont(m_hSysAudio, m_fontLabel);
-    m_hMicAudio = mk(L"BUTTON", L"录制麦克风", BS_AUTOCHECKBOX | WS_TABSTOP, dx, dy, 150, 28, IDC_MIC_AUDIO);
+    m_hMicAudio = mk(L"BUTTON", L"录制麦克风", BS_OWNERDRAW | WS_TABSTOP, dx, dy, 150, 28, IDC_MIC_AUDIO);
     Button_SetCheck(m_hMicAudio, BST_CHECKED);
     setFont(m_hMicAudio, m_fontLabel);
 
@@ -420,12 +567,24 @@ void AppWindow::CreateControls(HWND hwnd) {
 
 // ============================================================
 void AppWindow::PopulateSourceList() {
+    // Remember current selection to restore on manual refresh
+    int prevSel = (int)SendMessage(m_hSource, CB_GETCURSEL, 0, 0);
+    SourceItem prevItem = {};
+    bool hasPrev = false;
+    if (prevSel >= 0 && prevSel < (int)m_sourceItems.size()) {
+        prevItem = m_sourceItems[prevSel];
+        hasPrev = true;
+    }
+
     m_sourceItems.clear();
     SendMessage(m_hSource, CB_RESETCONTENT, 0, 0);
+
+    int primaryIdx = -1;
     for (auto& m : m_controller.GetMonitors()) {
         auto lb = std::format(L"[M{}] {}x{} {}", m.index, m.width, m.height, m.isPrimary ? L"主显示器" : L"");
         int idx = (int)SendMessage(m_hSource, CB_ADDSTRING, 0, (LPARAM)lb.c_str());
         if (idx >= 0) m_sourceItems.push_back({ SourceItem::Monitor, m.index, nullptr });
+        if (m.isPrimary && primaryIdx < 0) primaryIdx = idx;
     }
     m_winEnum.Refresh();
     for (auto& w : m_winEnum.Enumerate()) {
@@ -433,7 +592,30 @@ void AppWindow::PopulateSourceList() {
         int idx = (int)SendMessage(m_hSource, CB_ADDSTRING, 0, (LPARAM)lb.c_str());
         if (idx >= 0) m_sourceItems.push_back({ SourceItem::Window, 0, w.hwnd });
     }
-    SendMessage(m_hSource, CB_SETCURSEL, 0, 0);
+
+    // Select: try restore previous -> primary -> first -> none
+    int sel = -1;
+
+    if (hasPrev) {
+        for (int i = 0; i < (int)m_sourceItems.size(); ++i) {
+            if (m_sourceItems[i].type == prevItem.type &&
+                m_sourceItems[i].monitorIndex == prevItem.monitorIndex &&
+                m_sourceItems[i].hwnd == prevItem.hwnd) {
+                sel = i;
+                break;
+            }
+        }
+    }
+
+    if (sel < 0 && primaryIdx >= 0)
+        sel = primaryIdx;
+
+    if (sel < 0 && !m_sourceItems.empty())
+        sel = 0;
+
+    if (sel >= 0)
+        SendMessage(m_hSource, CB_SETCURSEL, sel, 0);
+
     ApplySelectionToConfig();
     UpdateWindowInfoText();
     RECT rc; GetClientRect(m_hwnd, &rc);
@@ -460,11 +642,15 @@ void AppWindow::ApplySettingsToUI() {
     m_config.fps = m_settings.fps; m_config.bitrateKbps = m_settings.bitrateKbps;
     m_config.captureSysAudio = m_settings.recordSystemAudio;
     m_config.captureMic = m_settings.recordMicrophone;
+    RedrawWindow(m_hFps30, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+    RedrawWindow(m_hFps60, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+    RedrawWindow(m_hSysAudio, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+    RedrawWindow(m_hMicAudio, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
 }
 
 void AppWindow::SaveSettings() {
     if (m_exeDir.empty()) return;
-    m_settings.fps = Button_GetCheck(m_hFps60) ? 60 : 30;
+    m_settings.fps = m_config.fps;
     int s = (int)SendMessage(m_hBitrate, CB_GETCURSEL, 0, 0);
     switch (s) {
     case 0: m_settings.bitrateKbps = 2500; break;
@@ -477,8 +663,8 @@ void AppWindow::SaveSettings() {
         break;
     }
     }
-    m_settings.recordSystemAudio = (Button_GetCheck(m_hSysAudio) == BST_CHECKED);
-    m_settings.recordMicrophone = (Button_GetCheck(m_hMicAudio) == BST_CHECKED);
+    m_settings.recordSystemAudio = m_config.captureSysAudio;
+    m_settings.recordMicrophone = m_config.captureMic;
     m_settings.Save(m_exeDir);
 }
 
@@ -505,23 +691,27 @@ void AppWindow::UpdateWindowInfoText() {
         wchar_t t[128]; GetWindowTextW(item.hwnd, t, 128);
         DWORD pid; GetWindowThreadProcessId(item.hwnd, &pid);
         RECT rc; GetClientRect(item.hwnd, &rc);
-        SetWindowTextW(m_hWinInfo, std::format(L"当前窗口：{:p} | {} | {}x{} | PID={}",
-            (void*)item.hwnd, t, rc.right - rc.left, rc.bottom - rc.top, pid).c_str());
+        m_winInfoText = std::format(L"当前窗口：{:p} | {} | {}x{} | PID={}",
+            (void*)item.hwnd, t, rc.right - rc.left, rc.bottom - rc.top, pid);
     } else if (item.type == SourceItem::Monitor) {
         for (auto& m : m_controller.GetMonitors()) {
             if (m.index == item.monitorIndex) {
-                SetWindowTextW(m_hWinInfo, std::format(L"当前显示器：{}x{} {}",
-                    m.width, m.height, m.isPrimary ? L"主显示器" : L"").c_str());
+                m_winInfoText = std::format(L"当前显示器：{}x{} {}",
+                    m.width, m.height, m.isPrimary ? L"主显示器" : L"");
                 break;
             }
         }
+    }
+    if (m_winInfoRect.right > m_winInfoRect.left) {
+        InvalidateRect(m_hwnd, &m_winInfoRect, TRUE);
+        UpdateWindow(m_hwnd);
     }
 }
 
 // ============================================================
 void AppWindow::OnStartRecording() {
     ApplySelectionToConfig();
-    m_config.fps = Button_GetCheck(m_hFps60) ? 60 : 30;
+    // m_config.fps is already set by ApplySettingsToUI / user clicks
     if (m_config.captureMode == CaptureMode::Window && m_config.targetWindow) {
         bool v = IsWindow(m_config.targetWindow) != FALSE;
         bool i = IsIconic(m_config.targetWindow) != FALSE;
@@ -532,8 +722,7 @@ void AppWindow::OnStartRecording() {
         if (i)  { SetStatusText(L"目标窗口已最小化，请先还原窗口。"); return; }
         if (!h) { SetStatusText(L"目标窗口不可见，请先显示窗口。"); return; }
     }
-    m_config.captureSysAudio = (Button_GetCheck(m_hSysAudio) == BST_CHECKED);
-    m_config.captureMic = (Button_GetCheck(m_hMicAudio) == BST_CHECKED);
+    // m_config.captureSysAudio and captureMic already set by ApplySettingsToUI / user clicks
     int s = (int)SendMessage(m_hBitrate, CB_GETCURSEL, 0, 0);
     switch (s) {
     case 0: m_config.bitrateKbps = 2500; break;
